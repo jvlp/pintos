@@ -20,6 +20,9 @@
 /* Number of timer ticks since OS booted. */
 static int64_t ticks;
 
+/* Number of ticks to wake the next thread */
+static int64_t ticks_to_wake;
+
 /* Number of loops per timer tick.
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
@@ -52,6 +55,7 @@ timer_init (void)
   pit_configure_channel (0, 2, TIMER_FREQ);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
   list_init (&sleep_list);
+  ticks_to_wake = -1;
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -111,6 +115,8 @@ thread_sleep_until (int64_t wakeup_tick)
 
   old_level = intr_disable ();
   cur->wakeup_tick = wakeup_tick;
+  if(wakeup_tick < ticks_to_wake || ticks_to_wake == -1)
+    ticks_to_wake = wakeup_tick;
   list_insert_ordered (&sleep_list, &cur->elem, wakeup_tick_less, NULL);
   thread_block ();
   intr_set_level (old_level);
@@ -125,12 +131,17 @@ thread_wake_sleeping (int64_t current_ticks)
     {
       struct list_elem *front = list_front (&sleep_list);
       struct thread *t = list_entry (front, struct thread, elem);
-      if (t->wakeup_tick > current_ticks)
+      if (t->wakeup_tick > current_ticks){
+        ticks_to_wake = t->wakeup_tick;
         break;
+      }
       list_remove (front);
       thread_unblock (t);
       //print_thread_list(&sleep_list, 48, "Sleep list");
     }
+
+  if(list_empty (&sleep_list))
+    ticks_to_wake = -1;
 }
 
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
@@ -223,6 +234,7 @@ timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
+  //if(ticks_to_wake != 1 && ticks_to_wake <= ticks)
   thread_wake_sleeping (ticks);
 }
 
