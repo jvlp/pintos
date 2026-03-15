@@ -71,6 +71,51 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
+/** Function to learn and debug the thread part.
+   The offset is 40 for all_list and 48 for the other list element*/
+void 
+print_thread_list(struct list *l, int offset, const char *text)
+{
+  //Visualização da lista de threads
+
+  /* Essas não são listas normais, são lista chamadas de 
+     intrusivas e funcionam diferente, os "elemento" não
+     guardam o endereços, na verdade os elementos
+     estão contidos também dentro item. */
+ 
+  //Calcula a posição do elemento dentro da struct thread, ofset para achar o elemento
+  //int offset_thread = sizeof(tid_t) + sizeof(enum thread_status) + sizeof(char[16]) + __SIZEOF_POINTER__ + sizeof(int) + sizeof(int64_t);
+
+  printf("################# %s ###################\n\n",text);
+
+  printf("Ofset na struct: %d\n",offset);
+  struct list_elem *head = l->head.next; //Guarda o primeiro elemento da thread
+
+  int flag = head != NULL ? 1:0;
+  while (flag) //Percorre os elementos de lista
+  {
+    struct thread *atual =  (void*)head - offset;
+    printf("Thread -> tid: %d; name: %s; status: ", atual->tid, atual->name);
+    switch (atual->status)
+    {
+      case 0: printf("Running"); break;
+      case 1: printf("Ready"); break;
+      case 2: printf("Blocked"); break;
+      case 3: printf("Dying"); break;
+      default:break;
+    }
+    printf(";\n           priority %d; wakeup_tick: %lld\n", atual->priority, atual->wakeup_tick);
+    
+    head = head->next;
+    if(head == &l->tail || head == NULL) flag = 0;
+
+  }
+  printf("\n");
+
+ printf("############################################\n\n");
+
+}
+
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -239,6 +284,8 @@ thread_unblock (struct thread *t)
   ASSERT (t->status == THREAD_BLOCKED);
   list_push_back (&ready_list, &t->elem);
   t->status = THREAD_READY;
+  //print_thread_list(&all_list, 40, "All list");
+  //print_thread_list(&ready_list, 48, "Ready list");
   intr_set_level (old_level);
 }
 

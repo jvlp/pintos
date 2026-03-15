@@ -129,6 +129,7 @@ thread_wake_sleeping (int64_t current_ticks)
         break;
       list_remove (front);
       thread_unblock (t);
+      //print_thread_list(&sleep_list, 48, "Sleep list");
     }
 }
 
