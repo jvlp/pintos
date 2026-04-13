@@ -20,15 +20,19 @@
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static void push_arguments_to_stack(char *executable_name, char *save_ptr, void **esp);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
    thread id, or TID_ERROR if the thread cannot be created. */
+
+/*A FUNÇÃO (process_execute) INICIA A EXECUÇÃO DE UM NOVO PROCESSO. NO CASO EM PINTOS, UM USER PROCESS COMEÇA COMO UMA THREAD DE KERNEL QUE DEPOIS CARREGA UM EXECUTÁVEL*/
 tid_t
 process_execute (const char *file_name) 
 {
-  char *fn_copy;
+  char *fn_copy, *fn_copy_02, *save_ptr;
+  char *executable_name;
   tid_t tid;
 
   /* Make a copy of FILE_NAME.
@@ -38,10 +42,25 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  /*Second copy */
+  /*uso de uma segunda cópia para armazenar o nome do arquivo executavel, sem perder também a string original*/
+  fn_copy_02 = palloc_get_page (0);
+  if (fn_copy_02 == NULL) {
+    palloc_free_page (fn_copy);
+    return TID_ERROR;
+  }
+  strlcpy (fn_copy_02, file_name, PGSIZE);
+  executable_name = strtok_r (fn_copy_02, " ", &save_ptr);
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (executable_name, PRI_DEFAULT, start_process, fn_copy);
+  /*além da copia 02, é passado a primeira cópia, com todos os argumentos, que será utilizada pelo start_process para preencher a pilha do usuário */
+
+  /*depois de usar a segunda cópia para criar a thread, ela não é mais necessária e por isso a memória é liberada*/
+  palloc_free_page (fn_copy_02);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+  /*caso a thread falhar é liberada a primeira cópia também*/
+    palloc_free_page (fn_copy);
   return tid;
 }
 
@@ -54,17 +73,50 @@ start_process (void *file_name_)
   struct intr_frame if_;
   bool success;
 
+  /*adição do executavel*/
+  char *save_ptr;
+  char *executable_name = strtok_r (file_name, " ", &save_ptr);
+
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  printf("DEBUG: tentando carregar o arquivo: '%s'\n", executable_name);
+  success = load (executable_name, &if_.eip, &if_.esp); /* LOAD THE EXECUTABLE AND INITIALIZE A STACK, THE USER STACK */
+  /*argumentos (nova função)*/
+  /*WHEN YOU HAVE THE USER PROGRAM YOU HAVE TO PASS A SET OF ARGUMENTS TO THE USER PROCESS, THIS PART IS ENTIRELY MISSING*/
+  /*if load failed, quit*/
+  if (!success)
+    {
+      palloc_free_page (file_name);
+      thread_exit ();
+    }
 
-  /* If load failed, quit. */
+  /**/
+  push_arguments_to_stack( executable_name, save_ptr, &if_.esp);
+
+
+  /*Processo de debugar após o empilhamento */
+  hex_dump((uintptr_t)if_.esp, if_.esp, 128, true);
+
   palloc_free_page (file_name);
-  if (!success) 
-    thread_exit ();
+  /*FALTAM ALGUMAS PARTES!!! SET UP STACK (USER STACK) */
+  /*WRITE MY OWN CODE HERE, TO SET UP A STACK */
+  /*BEFORE JUMP INTO THE FUNCTION YOU WANT TO EXECUTE AT LINE 3, YOU HAVE FIRST SET UP A STACK, SO THAT SET UP A STACK AT THE USER , WITH A PROPER LIST OF PARAMETERS*/
+  /* THIS IS THE FUNCTION I AM GOING TO WRITE*/
+
+  /*FOR START PROCESS WRITE A FUNCTION TO SET UP A USER STACK, SO THAT WHEN THE PROCESS  RESUMES IN THE INTS CONTROL IT POPS THE PARAMETERS FROM THE USER STACK AND RUNS THE PROGRAM */
+
+  /*I HAVE TO PUSH THE PARAMETER FROM THE STACK TOP ONE BY ONE*/
+  /*YOU HAVE TO ALIGN THIS WITH 4 BYTE, OU SEJA, SE FOR POR EXEMPLO UM ARGUMENTO COM 19.8 B ARREDONDA PARA 20 E DIVIDE EM 5 CHAR*/
+  /*DEPOIS DE PASSAR POR TODAS AS PARTES DO ARGUMENTO, OU SEJA TIVER ACABADO, NÃO TEM COMO RETORNAR SÓ FINALIZAR A THREAT, RETORNAR 0 COMO ARGUMENTO */
+  /*O ENDEREÇO RETORNA ZERO POR QUE IT'S JUST NEWLY CREATED PROCESS*/
+
+  /*UMA VEZ QUE IMPLEMENTA ESSA FUNÇÃO É POSSÍVEL CHECAR SE ALL THESE TECH FRAMES ARE PROPERLY SET UP USING THE FUNCTION HEXUM, THIS IS THE FUNCTION PROVIDED BY PINTOS */
+  /*BY USING HEX DUMP YOU CAN DUMP THE HEX MAP OF THE INTER FRAME AND I SHOULD BE ABLE TO FIND IF MY STACK HAS BEEN PROPERLY SET UP OR NOT*/
+  /*tarefa: HOW SET UP USERS*/
+
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -72,8 +124,61 @@ start_process (void *file_name_)
      arguments on the stack in the form of a `struct intr_frame',
      we just point the stack pointer (%esp) to our stack frame
      and jump to it. */
-  asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
+  asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory"); /*GETS OUT OF THE KERNEL AND JUMP TO THE USER PROGRAM I WANT TO EXECUTE */
   NOT_REACHED ();
+}
+
+void
+push_arguments_to_stack(char *executable_name, char *save_ptr, void **esp)
+{
+  char *token;
+  char *argv[64];
+  int argc = 0;
+
+  argv[argc++] = executable_name;
+
+  while ((token = strtok_r (NULL, " ", &save_ptr)) != NULL) {
+    argv[argc++] = token;
+  }
+
+  uintptr_t addresses[64];
+
+  /* Passo 1: construção da Pilha inversa das strings, ou seja, de trás para frente*/
+  for (int i = argc - 1; i >= 0; i--) {
+    size_t len = strlen(argv[i]) + 1;
+    *esp -= len;
+    memcpy(*esp, argv[i], len);
+    addresses[i] = (uintptr_t) *esp;
+  }
+
+  /* Passo 2: alinhamento da pilha em 4 bytes*/
+  while(((uintptr_t) *esp % 4) != 0) {
+    *esp -= 1;
+    *(uint8_t *) *esp = 0;
+  }
+
+  /*Passo 3: empilhar argv[argc]*/
+  *esp -= 4;
+  *(uint32_t *) *esp = 0;
+
+  /*Passo 4: empilhar os endereços das strings*/
+  for (int i = argc - 1; i >= 0; i--) {
+    *esp -= 4;
+    *(uint32_t *) *esp = (uint32_t) addresses[i];
+  }
+
+  /*Passo 5: Empilhar o ponteiro para o vetor de argumentos*/
+  uint32_t argv0_addr = (uint32_t) *esp;
+  *esp -= 4;
+  *(uint32_t *) *esp = argv0_addr;
+
+  /*Passo 6: Empilhar argc*/
+  *esp -= 4;
+  *(int *) *esp = argc;
+
+  /*Passo 7: Empilhar endereço de falso retorno (0) */
+  *esp -= 4;
+  *(uint32_t *) *esp = 0;
 }
 
 /* Waits for thread TID to die and returns its exit status.  If
@@ -381,14 +486,14 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
    or disk read error occurs. */
 static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
-              uint32_t read_bytes, uint32_t zero_bytes, bool writable) 
+              uint32_t read_bytes, uint32_t zero_bytes, bool writable)
 {
   ASSERT ((read_bytes + zero_bytes) % PGSIZE == 0);
   ASSERT (pg_ofs (upage) == 0);
   ASSERT (ofs % PGSIZE == 0);
 
   file_seek (file, ofs);
-  while (read_bytes > 0 || zero_bytes > 0) 
+  while (read_bytes > 0 || zero_bytes > 0)
     {
       /* Calculate how to fill this page.
          We will read PAGE_READ_BYTES bytes from FILE
@@ -405,15 +510,15 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
         {
           palloc_free_page (kpage);
-          return false; 
+          return false;
         }
       memset (kpage + page_read_bytes, 0, page_zero_bytes);
 
       /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
+      if (!install_page (upage, kpage, writable))
         {
           palloc_free_page (kpage);
-          return false; 
+          return false;
         }
 
       /* Advance. */
@@ -427,13 +532,13 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
 static bool
-setup_stack (void **esp) 
+setup_stack (void **esp)
 {
   uint8_t *kpage;
   bool success = false;
 
   kpage = palloc_get_page (PAL_USER | PAL_ZERO);
-  if (kpage != NULL) 
+  if (kpage != NULL)
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
       if (success)
