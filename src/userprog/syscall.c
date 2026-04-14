@@ -3,6 +3,9 @@
 #include <syscall-nr.h>
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "threads/vaddr.h"    /* Resolve o is_user_vaddr */
+#include "userprog/pagedir.h" /* Resolve o pagedir_get_page */
+#include "devices/shutdown.h" /* Resolve o shutdown_power_off */
 
 static void syscall_handler (struct intr_frame *);
 static void check_address (const void *vaddr);
@@ -66,7 +69,26 @@ syscall_handler (struct intr_frame *f)
       check_address (buffer);
       check_address (buffer + size - 1); //Vê se o final está dentro
       
-      // In process!
+      // File descriptor, descritor de arquivo, indica
+      // onde deve escrever.
+      int fd = *(int *)(f->esp + 4);
+
+      // No caso 1 pra imprimir no console mesmo
+      if (fd == 1) 
+        {
+          putbuf (buffer, size); //Função do Kernel para imprimir direto na saida padrão
+          f->eax = size; 
+          // Esse eax é o registrados onde ficam os retornos, nesse caso a gente retorna
+          // o tamanho da string escrita.
+        }
+      else 
+        {
+          // Agora só estamos focando em imprimir no buffer então
+          // retorna -1, para indicar como erro.
+          f->eax = -1; 
+        }
+        
+      // Still in process!
       break;
 
     default:
