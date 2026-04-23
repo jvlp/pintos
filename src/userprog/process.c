@@ -15,11 +15,24 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+static void wait_sync_init (void);
+
+/* Sincronizacao:
+   - waited_tid: qual filho o pai principal esta esperando
+   - waited_status: codigo de saida publicado pelo filho
+   - wait_sema: pai bloqueia em wait(), filho acorda em exit()
+   - wait_lock: protege acesso concorrente a waited_tid/waited_status */
+static struct lock wait_lock;
+static struct semaphore wait_sema;
+static bool wait_sync_initialized;
+static tid_t waited_tid = TID_ERROR;
+static int waited_status = -1;
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -29,20 +42,64 @@ tid_t
 process_execute (const char *file_name) 
 {
   char *fn_copy;
+  char *name_copy;
+  char *prog_name;
+  char *save_ptr;
   tid_t tid;
+  enum intr_level old_level;
 
-  /* Make a copy of FILE_NAME.
-     Otherwise there's a race between the caller and load(). */
+  // Garante que lock/sema globais ja existem antes de usar
+  wait_sync_init ();
+
+  /* - fn_copy: segue para a thread filha (load + stack)
+     - name_copy: usada apenas para extrair o nome do binario*/
   fn_copy = palloc_get_page (0);
-  if (fn_copy == NULL)
-    return TID_ERROR;
+  name_copy = palloc_get_page (0);
+  if (fn_copy == NULL || name_copy == NULL)
+    {
+      if (fn_copy != NULL)
+        palloc_free_page (fn_copy);
+      if (name_copy != NULL)
+        palloc_free_page (name_copy);
+      return TID_ERROR;
+    }
+  strlcpy (name_copy, file_name, PGSIZE);
+  // Somente o primeiro token é nome do executavel
+  prog_name = strtok_r (name_copy, " ", &save_ptr);
+  if (prog_name == NULL)
+    {
+      palloc_free_page (fn_copy);
+      palloc_free_page (name_copy);
+      return TID_ERROR;
+    }
   strlcpy (fn_copy, file_name, PGSIZE);
 
-  /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  old_level = intr_disable ();
+  tid = thread_create (prog_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    palloc_free_page (fn_copy);
+  else
+    {
+      // registra qual filho o wait deve observar
+      waited_tid = tid;
+      // valor padrao 
+      waited_status = -1;
+    }
+  intr_set_level (old_level);
+  palloc_free_page (name_copy);
   return tid;
+}
+
+static void
+wait_sync_init (void)
+{
+  if (!wait_sync_initialized)
+    {
+      lock_init (&wait_lock);
+      // começa em 0: pai bloqueia ate o filho terminar.
+      sema_init (&wait_sema, 0);
+      wait_sync_initialized = true;
+    }
 }
 
 /* A thread function that loads a user process and starts it
@@ -61,7 +118,6 @@ start_process (void *file_name_)
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (file_name, &if_.eip, &if_.esp);
 
-  /* If load failed, quit. */
   palloc_free_page (file_name);
   if (!success) 
     thread_exit ();
@@ -86,9 +142,29 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) 
 {
-  return -1;
+  int status;
+
+  wait_sync_init ();
+  lock_acquire (&wait_lock);
+  // se tid nao bate com o filho registrado, contrato manda -1.
+  if (child_tid != waited_tid)
+    {
+      lock_release (&wait_lock);
+      return -1;
+    }
+  lock_release (&wait_lock);
+
+  // dorme ate process_exit() do filho fazer sema_up().
+  sema_down (&wait_sema);
+
+  // apos acordar, le status publicado e limpa slot global.
+  lock_acquire (&wait_lock);
+  status = waited_status;
+  waited_tid = TID_ERROR;
+  lock_release (&wait_lock);
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -97,6 +173,21 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+
+  // mensagem exigida pelos testes de userprog.
+  if (cur->pagedir != NULL)
+    printf ("%s: exit(%d)\n", cur->name, cur->exit_status);
+
+  wait_sync_init ();
+  lock_acquire (&wait_lock);
+  // so publica status se este processo o esperado.
+  if (cur->tid == waited_tid)
+    {
+      waited_status = cur->exit_status;
+      // acorda quem estiver bloqueado em process_wait().
+      sema_up (&wait_sema);
+    }
+  lock_release (&wait_lock);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -195,7 +286,7 @@ struct Elf32_Phdr
 #define PF_W 2          /* Writable. */
 #define PF_R 4          /* Readable. */
 
-static bool setup_stack (void **esp);
+static bool setup_stack (void **esp, char *cmdline);
 static bool validate_segment (const struct Elf32_Phdr *, struct file *);
 static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
@@ -206,7 +297,7 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
    and its initial stack pointer into *ESP.
    Returns true if successful, false otherwise. */
 bool
-load (const char *file_name, void (**eip) (void), void **esp) 
+load (const char *cmdline, void (**eip) (void), void **esp) 
 {
   struct thread *t = thread_current ();
   struct Elf32_Ehdr ehdr;
@@ -214,12 +305,29 @@ load (const char *file_name, void (**eip) (void), void **esp)
   off_t file_ofs;
   bool success = false;
   int i;
+  char *cmdline_copy = NULL;
+  char *stack_cmdline = NULL;
+  char *file_name;
+  char *save_ptr;
 
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
     goto done;
   process_activate ();
+
+  cmdline_copy = palloc_get_page (0);
+  stack_cmdline = palloc_get_page (0);
+  if (cmdline_copy == NULL || stack_cmdline == NULL)
+    goto done;
+  /* strtok_r altera a string:
+     - cmdline_copy: para descobrir nome do binario (filesys_open)
+     - stack_cmdline: preservada para construir argc/argv em setup_stack */
+  strlcpy (cmdline_copy, cmdline, PGSIZE);
+  strlcpy (stack_cmdline, cmdline, PGSIZE);
+  file_name = strtok_r (cmdline_copy, " ", &save_ptr);
+  if (file_name == NULL)
+    goto done;
 
   /* Open executable file. */
   file = filesys_open (file_name);
@@ -302,7 +410,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
     }
 
   /* Set up stack. */
-  if (!setup_stack (esp))
+  if (!setup_stack (esp, stack_cmdline))
     goto done;
 
   /* Start address. */
@@ -312,10 +420,14 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
+  if (cmdline_copy != NULL)
+    palloc_free_page (cmdline_copy);
+  if (stack_cmdline != NULL)
+    palloc_free_page (stack_cmdline);
   file_close (file);
   return success;
 }
-
+
 /* load() helpers. */
 
 static bool install_page (void *upage, void *kpage, bool writable);
@@ -427,11 +539,20 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
 static bool
-setup_stack (void **esp) 
+setup_stack (void **esp, char *cmdline) 
 {
   uint8_t *kpage;
   bool success = false;
+  uint8_t *stack_bottom = ((uint8_t *) PHYS_BASE) - PGSIZE;
+  char *argv[64];
+  char *arg_addrs[64];
+  char *token;
+  char *save_ptr;
+  int argc = 0;
+  int i;
 
+  // aloca pagina zerada da pilha de usuario e mapeia no topo
+  // do espaco virtual de usuario (PHYS_BASE - PGSIZE ... PHYS_BASE).
   kpage = palloc_get_page (PAL_USER | PAL_ZERO);
   if (kpage != NULL) 
     {
@@ -441,7 +562,83 @@ setup_stack (void **esp)
       else
         palloc_free_page (kpage);
     }
-  return success;
+  if (!success)
+    return false;
+
+  // tokeniza cmdline para preencher argv[] e contar argc
+  for (token = strtok_r (cmdline, " ", &save_ptr); token != NULL;
+       token = strtok_r (NULL, " ", &save_ptr))
+    {
+      if (argc >= (int) (sizeof argv / sizeof *argv))
+        return false;
+      argv[argc++] = token;
+    }
+
+  // copia cada string de argumento para dentro da stack
+  // ordem reversa para facilitar depois a montagem de ponteiros argv[]
+  for (i = argc - 1; i >= 0; i--)
+    {
+      size_t len = strlen (argv[i]) + 1;
+      // stack cresce para baixo: decrementa esp antes de escrever.
+      *esp = (uint8_t *) *esp - len;
+      // protecao: nao ultrapassar a pagina unica de stack deste projeto.
+      if ((uint8_t *) *esp < stack_bottom)
+        return false;
+      memcpy (*esp, argv[i], len);
+      // salva endereco final da string para empilhar ponteiros depois.
+      arg_addrs[i] = *esp;
+    }
+
+  // alinhamento em 4 bytes.
+  while ((uintptr_t) *esp % sizeof (uint32_t) != 0)
+    {
+      *esp = (uint8_t *) *esp - 1;
+      if ((uint8_t *) *esp < stack_bottom)
+        return false;
+      // padding com zero para limpeza/debug.
+      *(uint8_t *) *esp = 0;
+    }
+
+  // sentinel argv[argc] = NULL.
+  *esp = (uint8_t *) *esp - sizeof (char *);
+  if ((uint8_t *) *esp < stack_bottom)
+    return false;
+  *(char **) *esp = NULL;
+
+  // empilha ponteiros argv[i] em ordem reversa para que
+  // argv[0] fique no menor endereco do vetor, como esperado em C.
+  for (i = argc - 1; i >= 0; i--)
+    {
+      *esp = (uint8_t *) *esp - sizeof (char *);
+      if ((uint8_t *) *esp < stack_bottom)
+        return false;
+      memcpy (*esp, &arg_addrs[i], sizeof (char *));
+    }
+
+  // empilha argv (char **), apontando para argv[0] na stack.
+  {
+    char **argv_start = (char **) *esp;
+    *esp = (uint8_t *) *esp - sizeof (char **);
+    if ((uint8_t *) *esp < stack_bottom)
+      return false;
+    memcpy (*esp, &argv_start, sizeof (char **));
+  }
+
+  // empilha argc (int).
+  *esp = (uint8_t *) *esp - sizeof (int);
+  if ((uint8_t *) *esp < stack_bottom)
+    return false;
+  memcpy (*esp, &argc, sizeof (int));
+
+  // empilha return address fake
+  // _start() nao retorna, mas o layout da pilha 
+  // deve parecer uma chamada de funcao padrao
+  *esp = (uint8_t *) *esp - sizeof (void *);
+  if ((uint8_t *) *esp < stack_bottom)
+    return false;
+  *(void **) *esp = NULL;
+
+  return true;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
