@@ -14,6 +14,7 @@
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
 #include "threads/synch.h"
 #include "threads/thread.h"
@@ -21,18 +22,40 @@
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
-static void wait_sync_init (void);
+static struct child_status *child_status_create (void);
+static void child_status_release (struct child_status *cs);
 
-/* Sincronizacao:
-   - waited_tid: qual filho o pai principal esta esperando
-   - waited_status: codigo de saida publicado pelo filho
-   - wait_sema: pai bloqueia em wait(), filho acorda em exit()
-   - wait_lock: protege acesso concorrente a waited_tid/waited_status */
-static struct lock wait_lock;
-static struct semaphore wait_sema;
-static bool wait_sync_initialized;
-static tid_t waited_tid = TID_ERROR;
-static int waited_status = -1;
+struct child_status
+  {
+    // tid real do filho depois de thread_create
+    tid_t tid;
+    // status que o pai recebe em wait
+    int exit_status;
+    // marca que o filho ja terminou
+    bool exited;
+    // impede wait duplicado no mesmo filho
+    bool waited;
+    // resultado do load para handshake de exec
+    bool load_success;
+    // contador de referencias pai + filho
+    int ref_cnt;
+    // protege campos desse registro compartilhado
+    struct lock lock;
+    // pai espera aqui o resultado de load
+    struct semaphore load_sema;
+    // pai espera aqui a saida do filho
+    struct semaphore exit_sema;
+    // encadeia esse filho na lista de filhos do pai
+    struct list_elem elem;
+  };
+
+struct start_process_args
+  {
+    // copia completa da linha de comando
+    char *cmdline;
+    // ponteiro para o registro compartilhado pai filho
+    struct child_status *wait_status;
+  };
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -41,65 +64,124 @@ static int waited_status = -1;
 tid_t
 process_execute (const char *file_name) 
 {
-  char *fn_copy;
+  char *cmdline;
   char *name_copy;
   char *prog_name;
   char *save_ptr;
+  struct start_process_args *args;
+  struct child_status *child;
   tid_t tid;
-  enum intr_level old_level;
 
-  // Garante que lock/sema globais ja existem antes de usar
-  wait_sync_init ();
+  cmdline = NULL;
+  name_copy = NULL;
+  args = NULL;
+  child = NULL;
 
-  /* - fn_copy: segue para a thread filha (load + stack)
-     - name_copy: usada apenas para extrair o nome do binario*/
-  fn_copy = palloc_get_page (0);
+  // cmdline segue para load e setup_stack na thread filha
+  // name_copy existe so para extrair o nome do executavel
+  cmdline = palloc_get_page (0);
   name_copy = palloc_get_page (0);
-  if (fn_copy == NULL || name_copy == NULL)
+  if (cmdline == NULL || name_copy == NULL)
     {
-      if (fn_copy != NULL)
-        palloc_free_page (fn_copy);
-      if (name_copy != NULL)
-        palloc_free_page (name_copy);
-      return TID_ERROR;
+      // se faltar memoria aborta de forma centralizada
+      goto fail;
     }
   strlcpy (name_copy, file_name, PGSIZE);
-  // Somente o primeiro token é nome do executavel
+  // o primeiro token vira o nome da thread no kernel
   prog_name = strtok_r (name_copy, " ", &save_ptr);
   if (prog_name == NULL)
+    goto fail;
+  // preserva a linha inteira para montar argc argv no filho
+  strlcpy (cmdline, file_name, PGSIZE);
+
+  // cria registro compartilhado para load e wait
+  child = child_status_create ();
+  if (child == NULL)
+    goto fail;
+
+  // empacota argumentos para start_process
+  args = malloc (sizeof *args);
+  if (args == NULL)
+    goto fail;
+  args->cmdline = cmdline;
+  args->wait_status = child;
+
+  tid = thread_create (prog_name, PRI_DEFAULT, start_process, args);
+  if (tid == TID_ERROR)
+    goto fail;
+
+  // publica tid e registra o filho na lista do pai
+  child->tid = tid;
+  list_push_back (&thread_current ()->children, &child->elem);
+  palloc_free_page (name_copy);
+  // handshake de exec pai so retorna apos saber se load funcionou
+  sema_down (&child->load_sema);
+  if (!child->load_success)
     {
-      palloc_free_page (fn_copy);
-      palloc_free_page (name_copy);
+      // se load falhou remove da lista e retorna erro de exec
+      list_remove (&child->elem);
+      child_status_release (child);
       return TID_ERROR;
     }
-  strlcpy (fn_copy, file_name, PGSIZE);
-
-  old_level = intr_disable ();
-  tid = thread_create (prog_name, PRI_DEFAULT, start_process, fn_copy);
-  if (tid == TID_ERROR)
-    palloc_free_page (fn_copy);
-  else
-    {
-      // registra qual filho o wait deve observar
-      waited_tid = tid;
-      // valor padrao 
-      waited_status = -1;
-    }
-  intr_set_level (old_level);
-  palloc_free_page (name_copy);
   return tid;
+
+ fail:
+  // bloco unico de limpeza para qualquer falha parcial
+  if (cmdline != NULL)
+    palloc_free_page (cmdline);
+  if (name_copy != NULL)
+    palloc_free_page (name_copy);
+  if (args != NULL)
+    free (args);
+  if (child != NULL)
+    {
+      child_status_release (child);
+      child_status_release (child);
+    }
+  return TID_ERROR;
 }
 
 static void
-wait_sync_init (void)
+child_status_release (struct child_status *cs)
 {
-  if (!wait_sync_initialized)
+  bool free_now = false;
+
+  if (cs == NULL)
+    return;
+
+  // decrementa contador com lock para evitar corrida
+  lock_acquire (&cs->lock);
+  cs->ref_cnt--;
+  if (cs->ref_cnt == 0)
+    free_now = true;
+  lock_release (&cs->lock);
+
+  // libera memoria so quando pai e filho ja soltaram referencia
+  if (free_now)
+    free (cs);
+}
+
+static struct child_status *
+child_status_create (void)
+{
+  struct child_status *cs = malloc (sizeof *cs);
+
+  if (cs != NULL)
     {
-      lock_init (&wait_lock);
-      // começa em 0: pai bloqueia ate o filho terminar.
-      sema_init (&wait_sema, 0);
-      wait_sync_initialized = true;
+      // estado inicial ate thread_create e load preencherem dados reais
+      cs->tid = TID_ERROR;
+      cs->exit_status = -1;
+      cs->exited = false;
+      cs->waited = false;
+      cs->load_success = false;
+      // duas referencias iniciais uma do pai e uma do filho
+      cs->ref_cnt = 2;
+      lock_init (&cs->lock);
+      // semaforos iniciam em zero para sincronizacao bloqueante
+      sema_init (&cs->load_sema, 0);
+      sema_init (&cs->exit_sema, 0);
     }
+  return cs;
 }
 
 /* A thread function that loads a user process and starts it
@@ -107,19 +189,34 @@ wait_sync_init (void)
 static void
 start_process (void *file_name_)
 {
-  char *file_name = file_name_;
+  struct start_process_args *args = file_name_;
+  char *cmdline = args->cmdline;
+  struct child_status *wait_status = args->wait_status;
   struct intr_frame if_;
   bool success;
+
+  // liga a thread filha ao registro compartilhado criado pelo pai
+  thread_current ()->wait_status = wait_status;
+  // args so e usado no bootstrap e pode ser liberado cedo
+  free (args);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
+  success = load (cmdline, &if_.eip, &if_.esp);
 
-  palloc_free_page (file_name);
+  // a copia da linha de comando pertence so ao filho
+  palloc_free_page (cmdline);
+
+  // publica resultado do load para process_execute
+  lock_acquire (&wait_status->lock);
+  wait_status->load_success = success;
+  lock_release (&wait_status->lock);
+  sema_up (&wait_status->load_sema);
   if (!success) 
+    // se load falhar encerra sem entrar em modo usuario
     thread_exit ();
 
   /* Start the user process by simulating a return from an
@@ -144,26 +241,48 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid) 
 {
-  int status;
+  struct thread *cur = thread_current ();
+  struct list_elem *e;
+  struct child_status *child = NULL;
+  int status = -1;
 
-  wait_sync_init ();
-  lock_acquire (&wait_lock);
-  // se tid nao bate com o filho registrado, contrato manda -1.
-  if (child_tid != waited_tid)
+  // procura o tid dentro da lista de filhos do processo atual
+  for (e = list_begin (&cur->children); e != list_end (&cur->children);
+       e = list_next (e))
     {
-      lock_release (&wait_lock);
+      struct child_status *candidate = list_entry (e, struct child_status, elem);
+      if (candidate->tid == child_tid)
+        {
+          child = candidate;
+          break;
+        }
+    }
+
+  if (child == NULL)
+    // contrato do pintos tid invalido ou nao filho retorna -1
+    return -1;
+
+  // garante que o mesmo filho nao seja esperado duas vezes
+  lock_acquire (&child->lock);
+  if (child->waited)
+    {
+      lock_release (&child->lock);
       return -1;
     }
-  lock_release (&wait_lock);
+  child->waited = true;
+  lock_release (&child->lock);
 
-  // dorme ate process_exit() do filho fazer sema_up().
-  sema_down (&wait_sema);
+  // bloqueia ate process_exit do filho sinalizar saida
+  sema_down (&child->exit_sema);
 
-  // apos acordar, le status publicado e limpa slot global.
-  lock_acquire (&wait_lock);
-  status = waited_status;
-  waited_tid = TID_ERROR;
-  lock_release (&wait_lock);
+  // le status final publicado pelo filho
+  lock_acquire (&child->lock);
+  status = child->exit_status;
+  lock_release (&child->lock);
+
+  // retira da lista do pai e libera referencia do lado pai
+  list_remove (&child->elem);
+  child_status_release (child);
   return status;
 }
 
@@ -173,21 +292,50 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+  struct list_elem *e;
+  int fd;
 
-  // mensagem exigida pelos testes de userprog.
+  // mensagem exigida pelos testes de userprog
   if (cur->pagedir != NULL)
     printf ("%s: exit(%d)\n", cur->name, cur->exit_status);
 
-  wait_sync_init ();
-  lock_acquire (&wait_lock);
-  // so publica status se este processo o esperado.
-  if (cur->tid == waited_tid)
+  if (cur->wait_status != NULL)
     {
-      waited_status = cur->exit_status;
-      // acorda quem estiver bloqueado em process_wait().
-      sema_up (&wait_sema);
+      struct child_status *self_status = cur->wait_status;
+
+      // publica status final para o pai que estiver em wait
+      lock_acquire (&self_status->lock);
+      self_status->exit_status = cur->exit_status;
+      self_status->exited = true;
+      lock_release (&self_status->lock);
+      sema_up (&self_status->exit_sema);
+      // solta referencia do lado filho nesse registro
+      child_status_release (self_status);
+      cur->wait_status = NULL;
     }
-  lock_release (&wait_lock);
+
+  // limpa filhos que o pai nao esperou para evitar vazamento
+  while (!list_empty (&cur->children))
+    {
+      e = list_pop_front (&cur->children);
+      child_status_release (list_entry (e, struct child_status, elem));
+    }
+
+  // fecha todos os arquivos de dados abertos por esse processo
+  for (fd = 2; fd < 128; fd++)
+    if (cur->fd_table[fd] != NULL)
+      {
+        file_close (cur->fd_table[fd]);
+        cur->fd_table[fd] = NULL;
+      }
+
+  // libera lock de escrita do binario e fecha executavel
+  if (cur->executable != NULL)
+    {
+      file_allow_write (cur->executable);
+      file_close (cur->executable);
+      cur->executable = NULL;
+    }
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -337,7 +485,7 @@ load (const char *cmdline, void (**eip) (void), void **esp)
       goto done; 
     }
 
-    file_deny_write (file);    // Impede modificações no arquivo
+    file_deny_write (file);    // impede modificacoes no arquivo durante execucao
     t->executable = file;
   //t->executable = NULL;
 
@@ -428,13 +576,6 @@ load (const char *cmdline, void (**eip) (void), void **esp)
     palloc_free_page (cmdline_copy);
   if (stack_cmdline != NULL)
     palloc_free_page (stack_cmdline);
-  
- if (t->executable != NULL)
-  {
-    file_allow_write (t->executable);
-    file_close (t->executable);
-    t->executable = NULL;
-  }
   return success;
 }
 

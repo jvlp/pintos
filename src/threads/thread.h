@@ -18,6 +18,8 @@ enum thread_status
    You can redefine this to whatever type you like. */
 typedef int tid_t;
 #define TID_ERROR ((tid_t) -1)          /* Error value for tid_t. */
+struct file;
+struct child_status;
 
 /* Thread priorities. */
 #define PRI_MIN 0                       /* Lowest priority. */
@@ -98,8 +100,18 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    // codigo final usado por wait e mensagem de saida
     int exit_status;
-    struct file* executable;
+    // arquivo do binario em exec mantido aberto para deny_write
+    struct file *executable;
+    // lista de registros de filhos desse processo
+    struct list children;               /* Children wait records. */
+    // registro compartilhado desse processo no contexto do pai
+    struct child_status *wait_status;   /* This thread's wait record in parent. */
+    // tabela local de descritores 2..127
+    struct file *fd_table[128];         /* Open file descriptors (2+). */
+    // cursor de proxima tentativa de alocacao de fd
+    int next_fd;                        /* Next fd candidate. */
 #endif
 
     /* Owned by thread.c. */

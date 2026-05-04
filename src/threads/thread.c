@@ -539,6 +539,18 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->wakeup_tick = 0;
+#ifdef USERPROG
+  // status padrao antes de qualquer syscall_exit ou fault
+  t->exit_status = -1;
+  // executavel so e definido quando load abre o binario
+  t->executable = NULL;
+  // lista de filhos inicia vazia para cada novo processo
+  list_init (&t->children);
+  // sem vinculo com pai ate process_execute configurar
+  t->wait_status = NULL;
+  // 0 e 1 ficam reservados para stdin e stdout
+  t->next_fd = 2;
+#endif
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();
