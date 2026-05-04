@@ -9,6 +9,10 @@
 #include "threads/vaddr.h"
 #include "userprog/process.h"
 #include "userprog/pagedir.h"
+#include "threads/synch.h"
+#include <stdio.h>
+
+static struct lock filesys_lock;
 
 static void syscall_handler (struct intr_frame *);
 static void syscall_exit (int status) NO_RETURN;
@@ -21,6 +25,7 @@ syscall_init (void)
 {
   /* int 0x30 eh a "porta" usada pelo programa de usuario para
      entrar no kernel e pedir um servico (syscall). */
+  lock_init(&filesys_lock); //Inicializa o lock para as escritas.
   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
 }
 
@@ -29,6 +34,8 @@ syscall_handler (struct intr_frame *f)
 {
   /* Convencao: numero da syscall fica em *esp do processo usuario. */
   uint32_t syscall_nr = fetch_u32 (f->esp);
+
+  //printf("Syscall detectada: %d\n", syscall_nr);
 
   switch (syscall_nr)
     {
@@ -56,7 +63,11 @@ syscall_handler (struct intr_frame *f)
           }
         /* Nunca acessamos memoria de usuario sem validar antes. */
         validate_user_buffer (buffer, size);
-        putbuf (buffer, size);
+
+        lock_acquire(&filesys_lock);
+        /**/putbuf (buffer, size);
+        lock_release(&filesys_lock);
+
         /* Valor de retorno de syscall vai em eax. */
         f->eax = (int) size;
       }
@@ -72,6 +83,25 @@ syscall_handler (struct intr_frame *f)
              iniciais mas nao todos os casos concorrentes de projeto 2. */
         tid_t tid = (tid_t) fetch_u32 ((uint32_t *) f->esp + 1);
         f->eax = process_wait (tid);
+      }
+      break;
+
+    case SYS_EXEC:
+      {
+        /* Pega o ponteiro da string de comando na pilha */
+        const char *comand = (const char *) fetch_u32 ((uint32_t *) f->esp + 1);
+        
+        /* Valida a string (não apenas o ponteiro, mas a string inteira) */
+        int i = 0;
+        while (comand[i] != '\0'){
+          validate_user_address (comand + i); //Valida do primerio até o último endereço
+          i++;   
+        }
+        
+        /* Executa e retorna o TID (ou -1 se falhar) */
+        lock_acquire(&filesys_lock);
+        /**/f->eax = process_execute (comand);   
+        lock_release(&filesys_lock);
       }
       break;
 
@@ -100,8 +130,11 @@ validate_user_address (const void *uaddr)
      - nao pode ser NULL
      - precisa estar no espaco de usuario (abaixo de PHYS_BASE)
      - precisa estar mapeado na pagedir atual */
-  if (uaddr == NULL || !is_user_vaddr (uaddr)
-      || pagedir_get_page (cur->pagedir, uaddr) == NULL)
+  if (
+      uaddr == NULL || !is_user_vaddr (uaddr) ||
+      uaddr < (void *) 0x08048000 ||  // Verifica se está no espaço virtual destinado corretamente
+      pagedir_get_page (cur->pagedir, uaddr) == NULL
+    )
     syscall_exit (-1);
 }
 

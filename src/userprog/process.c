@@ -337,6 +337,10 @@ load (const char *cmdline, void (**eip) (void), void **esp)
       goto done; 
     }
 
+    file_deny_write (file);    // Impede modificações no arquivo
+    t->executable = file;
+  //t->executable = NULL;
+
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
@@ -424,7 +428,13 @@ load (const char *cmdline, void (**eip) (void), void **esp)
     palloc_free_page (cmdline_copy);
   if (stack_cmdline != NULL)
     palloc_free_page (stack_cmdline);
-  file_close (file);
+  
+ if (t->executable != NULL)
+  {
+    file_allow_write (t->executable);
+    file_close (t->executable);
+    t->executable = NULL;
+  }
   return success;
 }
 

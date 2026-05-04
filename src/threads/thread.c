@@ -71,6 +71,51 @@ static void schedule (void);
 void thread_schedule_tail (struct thread *prev);
 static tid_t allocate_tid (void);
 
+/** Function to learn and debug the thread part.
+   The offset is 40 for all_list and 48 for the other list element*/
+void 
+print_thread_list(struct list *l, int offset, const char *text)
+{
+  //Visualização da lista de threads
+
+  /* Essas não são listas normais, são lista chamadas de 
+     intrusivas e funcionam diferente, os "elemento" não
+     guardam o endereços, na verdade os elementos
+     estão contidos também dentro item. */
+ 
+  //Calcula a posição do elemento dentro da struct thread, ofset para achar o elemento
+  //int offset_thread = sizeof(tid_t) + sizeof(enum thread_status) + sizeof(char[16]) + __SIZEOF_POINTER__ + sizeof(int) + sizeof(int64_t);
+
+  printf("################# %s ###################\n\n",text);
+
+  printf("Ofset na struct: %d\n",offset);
+  struct list_elem *head = l->head.next; //Guarda o primeiro elemento da thread
+
+  int flag = head != NULL ? 1:0;
+  while (flag) //Percorre os elementos de lista
+  {
+    struct thread *atual =  (void*)head - offset;
+    printf("Thread -> tid: %d; name: %s; status: ", atual->tid, atual->name);
+    switch (atual->status)
+    {
+      case 0: printf("Running"); break;
+      case 1: printf("Ready"); break;
+      case 2: printf("Blocked"); break;
+      case 3: printf("Dying"); break;
+      default:break;
+    }
+    printf(";\n           priority %d; wakeup_tick: %lld\n", atual->priority, atual->wakeup_tick);
+    
+    head = head->next;
+    if(head == &l->tail || head == NULL) flag = 0;
+
+  }
+  printf("\n");
+
+ printf("############################################\n\n");
+
+}
+
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
    general and it is possible in this case only because loader.S
@@ -201,7 +246,20 @@ thread_create (const char *name, int priority,
   /* Add to run queue. */
   thread_unblock (t);
 
+  if ( priority > thread_current ()->priority) {
+      thread_yield ();
+  }
+
   return tid;
+}
+
+static bool 
+thread_priority_less(const struct list_elem *a, const struct list_elem *b,
+                    void *aux UNUSED)
+{
+  struct thread *ta = list_entry (a, struct thread, elem);
+  struct thread *tb = list_entry (b, struct thread, elem);
+  return ta->priority > tb->priority;
 }
 
 /* Puts the current thread to sleep.  It will not be scheduled
@@ -237,8 +295,10 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  list_insert_ordered (&ready_list, &t->elem, thread_priority_less, NULL);
   t->status = THREAD_READY;
+  //print_thread_list(&all_list, 40, "All list");
+  //print_thread_list(&ready_list, 48, "Ready list");
   intr_set_level (old_level);
 }
 
@@ -308,7 +368,7 @@ thread_yield (void)
 
   old_level = intr_disable ();
   if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+    list_insert_ordered (&ready_list, &cur->elem, thread_priority_less, NULL);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -335,7 +395,23 @@ thread_foreach (thread_action_func *func, void *aux)
 void
 thread_set_priority (int new_priority) 
 {
+  enum intr_level old_level = intr_disable ();
+
   thread_current ()->priority = new_priority;
+
+  /* If the new priority are higher then the priority of 
+     the head of ready_list it has to run. */
+  if (!list_empty (&ready_list) &&
+      list_entry(list_begin (&ready_list), struct thread, elem)->priority > thread_current ()->priority) 
+  {
+      intr_set_level (old_level);
+      thread_yield ();
+  }
+  else
+  {
+    intr_set_level (old_level);
+  }
+  
 }
 
 /* Returns the current thread's priority. */
@@ -462,6 +538,7 @@ init_thread (struct thread *t, const char *name, int priority)
   strlcpy (t->name, name, sizeof t->name);
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
+  t->wakeup_tick = 0;
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();

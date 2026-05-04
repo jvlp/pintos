@@ -92,11 +92,14 @@ struct thread
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
+    
+    unsigned long int wakeup_tick;
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
     int exit_status;
+    struct file* executable;
 #endif
 
     /* Owned by thread.c. */
