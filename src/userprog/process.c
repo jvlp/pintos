@@ -19,6 +19,7 @@
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "vm/frame.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -79,8 +80,8 @@ process_execute (const char *file_name)
 
   // cmdline segue para load e setup_stack na thread filha
   // name_copy existe so para extrair o nome do executavel
-  cmdline = palloc_get_page (0);
-  name_copy = palloc_get_page (0);
+  cmdline = frame_allocate(0);
+  name_copy = frame_allocate(0);
   if (cmdline == NULL || name_copy == NULL)
     {
       // se faltar memoria aborta de forma centralizada
@@ -128,9 +129,9 @@ process_execute (const char *file_name)
  fail:
   // bloco unico de limpeza para qualquer falha parcial
   if (cmdline != NULL)
-    palloc_free_page (cmdline);
+    frame_free (cmdline);
   if (name_copy != NULL)
-    palloc_free_page (name_copy);
+    frame_free (name_copy);
   if (args != NULL)
     free (args);
   if (child != NULL)
@@ -208,7 +209,7 @@ start_process (void *file_name_)
   success = load (cmdline, &if_.eip, &if_.esp);
 
   // a copia da linha de comando pertence so ao filho
-  palloc_free_page (cmdline);
+  frame_free (cmdline);
 
   // publica resultado do load para process_execute
   lock_acquire (&wait_status->lock);
@@ -464,8 +465,8 @@ load (const char *cmdline, void (**eip) (void), void **esp)
     goto done;
   process_activate ();
 
-  cmdline_copy = palloc_get_page (0);
-  stack_cmdline = palloc_get_page (0);
+  cmdline_copy = frame_allocate(0);
+  stack_cmdline = frame_allocate(0);
   if (cmdline_copy == NULL || stack_cmdline == NULL)
     goto done;
   /* strtok_r altera a string:
@@ -573,9 +574,9 @@ load (const char *cmdline, void (**eip) (void), void **esp)
  done:
   /* We arrive here whether the load is successful or not. */
   if (cmdline_copy != NULL)
-    palloc_free_page (cmdline_copy);
+    frame_free (cmdline_copy);
   if (stack_cmdline != NULL)
-    palloc_free_page (stack_cmdline);
+    frame_free (stack_cmdline);
   return success;
 }
 
@@ -660,14 +661,14 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
       /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
+      uint8_t *kpage = frame_allocate(PAL_USER);
       if (kpage == NULL)
         return false;
 
       /* Load this page. */
       if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
         {
-          palloc_free_page (kpage);
+          frame_free (kpage);
           return false; 
         }
       memset (kpage + page_read_bytes, 0, page_zero_bytes);
@@ -675,7 +676,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       /* Add the page to the process's address space. */
       if (!install_page (upage, kpage, writable)) 
         {
-          palloc_free_page (kpage);
+          frame_free (kpage);
           return false; 
         }
 
@@ -704,14 +705,14 @@ setup_stack (void **esp, char *cmdline)
 
   // aloca pagina zerada da pilha de usuario e mapeia no topo
   // do espaco virtual de usuario (PHYS_BASE - PGSIZE ... PHYS_BASE).
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+  kpage = frame_allocate (PAL_USER | PAL_ZERO);
   if (kpage != NULL) 
     {
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
       if (success)
         *esp = PHYS_BASE;
       else
-        palloc_free_page (kpage);
+        frame_free (kpage);
     }
   if (!success)
     return false;
@@ -798,7 +799,7 @@ setup_stack (void **esp, char *cmdline)
    otherwise, it is read-only.
    UPAGE must not already be mapped.
    KPAGE should probably be a page obtained from the user pool
-   with palloc_get_page().
+   with palloc_get_page(), now with frame_allocate()
    Returns true on success, false if UPAGE is already mapped or
    if memory allocation fails. */
 static bool
