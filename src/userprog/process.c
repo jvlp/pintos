@@ -211,7 +211,7 @@ start_process (void *file_name_)
   success = load (cmdline, &if_.eip, &if_.esp);
 
   // a copia da linha de comando pertence so ao filho
-  frame_free (cmdline);
+  palloc_free_page (cmdline);
 
   // publica resultado do load para process_execute
   lock_acquire (&wait_status->lock);
@@ -685,12 +685,18 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       entry->is_loaded = false; //Ainda não alocado
       entry->writable = writable; 
       entry->file = file_reopen (file); // Tem que reabrir o file
+      if (entry->file == NULL) {
+        free (entry);
+        return false; // Falha ao reabrir o arquivo
+      }
       entry->offset = ofs;
       entry->read_bytes = page_read_bytes;
       entry->zero_bytes = page_zero_bytes;
 
       // Insere na SPT do processo 
       if (!spt_insert (&thread_current ()->spt, entry)) {
+          if (entry->file != NULL)
+             file_close (entry->file);
           free (entry);
           return false; // Falha ao inserir
       }

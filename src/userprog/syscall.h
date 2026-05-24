@@ -1,6 +1,8 @@
 #ifndef USERPROG_SYSCALL_H
 #define USERPROG_SYSCALL_H
 
+#include "threads/synch.h"
+
 // Lock unico para serializar acesso ao filesys, que não é thread safe.
 extern struct lock filesys_lock;
 /* Movido para cá para evitar erros de leitura gerais,

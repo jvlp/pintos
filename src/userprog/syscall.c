@@ -8,7 +8,6 @@
 #include "filesys/filesys.h"
 #include "lib/kernel/stdio.h"
 #include "threads/interrupt.h"
-#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"

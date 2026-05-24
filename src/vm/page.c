@@ -122,7 +122,7 @@ spt_load_page (struct spt_entry *entry)
 
     // Preenche o restante do frame com zeros
     if (entry->zero_bytes > 0) {
-        memset (kpage + entry->read_bytes, 0, entry->zero_bytes);
+        memset ((uint8_t *) kpage + entry->read_bytes, 0, entry->zero_bytes);
     }
 
     // Conecta o endereço virtual ao físico
