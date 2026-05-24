@@ -4,6 +4,8 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "vm/page.h"
+#include "threads/vaddr.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -128,34 +130,93 @@ page_fault (struct intr_frame *f)
   bool user;         /* True: access by user, false: access by kernel. */
   void *fault_addr;  /* Fault address. */
 
-  /* Obtain faulting address, the virtual address that was
-     accessed to cause the fault.  It may point to code or to
-     data.  It is not necessarily the address of the instruction
-     that caused the fault (that's f->eip).
-     See [IA32-v2a] "MOV--Move to/from Control Registers" and
-     [IA32-v3a] 5.15 "Interrupt 14--Page Fault Exception
-     (#PF)". */
+  // Obtém o endereço que causou a falta e as flags do hardware
   asm ("movl %%cr2, %0" : "=r" (fault_addr));
 
-  /* Turn interrupts back on (they were only off so that we could
-     be assured of reading CR2 before it changed). */
+  // Religa as interrupções para poder ler disco e usar locks!
   intr_enable ();
 
-  /* Count page faults. */
-  page_fault_cnt++;
-
-  /* Determine cause. */
+  // PFE é o código em binário
   not_present = (f->error_code & PF_P) == 0;
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
-  // variaveis ficam para documentar decode basico do fault
-  (void) not_present;
-  (void) write;
-  (void) user;
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
-  kill (f);
+  //printf("DEBUG PAGE FAULT: addr=%p, not_present=%d, user=%d\n", fault_addr, not_present, user);
+
+  if (fault_addr == NULL || is_kernel_vaddr(fault_addr) || !not_present)
+  {
+    thread_current ()->exit_status = -1;
+    thread_exit ();
+  }
+  
+  // Arredonda o endereço para encontrar a chave tabela
+  void *upage = pg_round_down (fault_addr);
+  struct thread *cur = thread_current ();
+  struct spt_entry *entry = spt_find (&cur->spt, upage); //Acha a entrada
+
+  if (entry != NULL) 
+  {
+    if (entry->is_loaded) {
+      // Se já estava carregada, o usuário tentou escrever numa página read-only
+      thread_current ()->exit_status = -1;
+      thread_exit ();
+    }
+
+    if (entry->type == PAGE_FILE) 
+    {
+       // Bota a página para carregar
+       if (!spt_load_page (entry)) {
+             PANIC ("Falha ao carregar do disco.");
+       }
+
+       return; // Volta e tentar carregar de novo
+    }
+    else if (entry->type == PAGE_SWAP || entry->type == PAGE_ZERO) 
+    {
+      // Puxar do swap ou zera a página
+    }
+
+  } 
+    else 
+  {
+     // Pode ser um seg fault ou a pilha tentando crescer. 
+     thread_current ()->exit_status = -1;
+     thread_exit (); // Provisório, se não achou e não é pilha, morre.
+  }  
+
+  /* Código antigo 
+
+   // Obtain faulting address, the virtual address that was
+   // accessed to cause the fault.  It may point to code or to
+   // data.  It is not necessarily the address of the instruction
+   // that caused the fault (that's f->eip).
+   // See [IA32-v2a] "MOV--Move to/from Control Registers" and
+   // [IA32-v3a] 5.15 "Interrupt 14--Page Fault Exception
+   // (#PF)". 
+   asm ("movl %%cr2, %0" : "=r" (fault_addr));
+
+   // Turn interrupts back on (they were only off so that we could
+   // be assured of reading CR2 before it changed). 
+   intr_enable ();
+
+   // Count page faults. 
+   page_fault_cnt++;
+
+   // Determine cause. 
+   not_present = (f->error_code & PF_P) == 0;
+   write = (f->error_code & PF_W) != 0;
+   user = (f->error_code & PF_U) != 0;
+   // variaveis ficam para documentar decode basico do fault
+   (void) not_present;
+   (void) write;
+   (void) user;
+
+   // To implement virtual memory, delete the rest of the function
+   // body, and replace it with code that brings in the page to
+   // which fault_addr refers. 
+   kill (f);
+
+  */
+
 }
 

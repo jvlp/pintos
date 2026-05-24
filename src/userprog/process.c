@@ -19,6 +19,9 @@
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "vm/frame.h"
+#include "vm/page.h"
+#include "userprog/syscall.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -79,8 +82,8 @@ process_execute (const char *file_name)
 
   // cmdline segue para load e setup_stack na thread filha
   // name_copy existe so para extrair o nome do executavel
-  cmdline = palloc_get_page (0);
-  name_copy = palloc_get_page (0);
+  cmdline = palloc_get_page(0);
+  name_copy = palloc_get_page(0);
   if (cmdline == NULL || name_copy == NULL)
     {
       // se faltar memoria aborta de forma centralizada
@@ -208,7 +211,7 @@ start_process (void *file_name_)
   success = load (cmdline, &if_.eip, &if_.esp);
 
   // a copia da linha de comando pertence so ao filho
-  palloc_free_page (cmdline);
+  frame_free (cmdline);
 
   // publica resultado do load para process_execute
   lock_acquire (&wait_status->lock);
@@ -294,6 +297,8 @@ process_exit (void)
   uint32_t *pd;
   struct list_elem *e;
   int fd;
+
+  spt_destroy (&cur->spt);
 
   // mensagem exigida pelos testes de userprog
   if (cur->pagedir != NULL)
@@ -464,30 +469,37 @@ load (const char *cmdline, void (**eip) (void), void **esp)
     goto done;
   process_activate ();
 
-  cmdline_copy = palloc_get_page (0);
-  stack_cmdline = palloc_get_page (0);
-  if (cmdline_copy == NULL || stack_cmdline == NULL)
+  spt_init (&t->spt);
+
+  cmdline_copy = palloc_get_page(0);
+  stack_cmdline = palloc_get_page(0);
+  
+  // Caso de erro na alocação
+  if (cmdline_copy == NULL || stack_cmdline == NULL) 
     goto done;
+
   /* strtok_r altera a string:
      - cmdline_copy: para descobrir nome do binario (filesys_open)
      - stack_cmdline: preservada para construir argc/argv em setup_stack */
   strlcpy (cmdline_copy, cmdline, PGSIZE);
   strlcpy (stack_cmdline, cmdline, PGSIZE);
+
   file_name = strtok_r (cmdline_copy, " ", &save_ptr);
-  if (file_name == NULL)
+  if (file_name == NULL) 
     goto done;
 
   /* Open executable file. */
+  lock_acquire (&filesys_lock);  // Protege a busca no diretório 
   file = filesys_open (file_name);
+  lock_release (&filesys_lock);
   if (file == NULL) 
-    {
-      printf ("load: %s: open failed\n", file_name);
-      goto done; 
-    }
+  {
+    printf ("load: %s: open failed\n", file_name);
+    goto done; 
+  }
 
-    file_deny_write (file);    // impede modificacoes no arquivo durante execucao
-    t->executable = file;
-  //t->executable = NULL;
+  file_deny_write (file);    // impede modificacoes no arquivo durante execucao
+  t->executable = file;
 
   /* Read and verify executable header. */
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
@@ -659,30 +671,57 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
-        return false;
+      /* O código não deve mais carregar a página toda, em vez disso se cria 
+        a tabela de página e se aloca de acordo com a necessidade. Para cada página que
+        deveria ser alocada se vai criar um elemento na spt. */
 
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+      struct spt_entry *entry = malloc (sizeof (struct spt_entry));
+      if (entry == NULL) {
+          return false; // Acabou a memória do Kernel 
+      }
 
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
+      entry->upage = upage;
+      entry->type = PAGE_FILE; //Está dentro de um arquivo
+      entry->is_loaded = false; //Ainda não alocado
+      entry->writable = writable; 
+      entry->file = file_reopen (file); // Tem que reabrir o file
+      entry->offset = ofs;
+      entry->read_bytes = page_read_bytes;
+      entry->zero_bytes = page_zero_bytes;
+
+      // Insere na SPT do processo 
+      if (!spt_insert (&thread_current ()->spt, entry)) {
+          free (entry);
+          return false; // Falha ao inserir
+      }
+
+      /* Código anterior...    
+        // Get a page of memory.
+        uint8_t *kpage = frame_allocate(PAL_USER);
+        if (kpage == NULL)
+          return false;
+
+        // Load this page. 
+        if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+          {
+            frame_free (kpage);
+            return false; 
+          }
+        memset (kpage + page_read_bytes, 0, page_zero_bytes);
+
+        // Add the page to the process's address space. 
+        if (!install_page (upage, kpage, writable)) 
+          {
+            frame_free (kpage);
+            return false; 
+          }
+      */
 
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
       upage += PGSIZE;
+      ofs += page_read_bytes;
     }
   return true;
 }
@@ -704,15 +743,47 @@ setup_stack (void **esp, char *cmdline)
 
   // aloca pagina zerada da pilha de usuario e mapeia no topo
   // do espaco virtual de usuario (PHYS_BASE - PGSIZE ... PHYS_BASE).
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+  void *upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
+  kpage = frame_allocate (PAL_USER | PAL_ZERO, upage);
   if (kpage != NULL) 
     {
+      // Essa memória deve ser alocada sem ser do lazy mode
       success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+
       if (success)
+      {
         *esp = PHYS_BASE;
+        
+        // Mapeando para a tabela de páginas
+        struct spt_entry *entry = malloc (sizeof (struct spt_entry));
+        if (entry == NULL) 
+        {
+          frame_free (kpage);
+          return false;
+        }
+
+        entry->upage = upage;
+        entry->type = PAGE_ZERO;   // Pilha nasce limpa
+        entry->is_loaded = true;   // Ela já está ma ram
+        entry->writable = true;
+
+        // Insere na tabela do processo 
+        if (!spt_insert (&thread_current ()->spt, entry)) 
+        {
+          free (entry);
+          frame_free (kpage);
+          return false;
+        }
+
+        frame_unpin (kpage);
+      }
       else
-        palloc_free_page (kpage);
+      {
+        frame_free (kpage);
+      }
+
     }
+
   if (!success)
     return false;
 
@@ -798,7 +869,7 @@ setup_stack (void **esp, char *cmdline)
    otherwise, it is read-only.
    UPAGE must not already be mapped.
    KPAGE should probably be a page obtained from the user pool
-   with palloc_get_page().
+   with palloc_get_page(), now with frame_allocate()
    Returns true on success, false if UPAGE is already mapped or
    if memory allocation fails. */
 static bool
