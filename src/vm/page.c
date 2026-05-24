@@ -1,8 +1,12 @@
 #include "page.h"
-#include "threads.h"
+#include "threads/thread.h"
 #include "userprog/pagedir.h"
 #include "frame.h"
-#include "malloc.h"
+#include "threads/malloc.h"
+#include "threads/vaddr.h"
+#include <string.h>
+#include "userprog/syscall.h"
+#include "threads/synch.h"
 
 // Função hash, chaveamento
 static unsigned int 
@@ -74,7 +78,13 @@ spt_destroy_func (struct hash_elem *e, void *aux UNUSED)
         {
             /* Chama a função que você criou em frame.c para destruir e liberar a RAM */
             frame_free (kpage);
+            /* Limpa o mapeamento no hardware para evitar o double free depois */
+            pagedir_clear_page (thread_current ()->pagedir, entry->upage);
         }
+    }
+
+    if (entry->type == PAGE_FILE && entry->file != NULL) {
+        file_close (entry->file);
     }
 
     // Libera a memória alocada pro registro 
@@ -86,4 +96,43 @@ void
 spt_destroy (struct hash *spt)
 {
     hash_destroy (spt, spt_destroy_func);
+}
+
+bool 
+spt_load_page (struct spt_entry *entry) 
+{
+    //Pede um frame físico para a Frame Table.
+    void *kpage = frame_allocate (PAL_USER, entry->upage);
+    if (kpage == NULL) {
+        return false;
+    }
+
+    //Lê os dados do arquivo 
+    if (entry->read_bytes > 0) {
+        // Lê do disco no offset
+        lock_acquire (&filesys_lock); /* Pega o cadeado */
+        int bytes_read = file_read_at (entry->file, kpage, entry->read_bytes, entry->offset);
+        lock_release (&filesys_lock); /* Solta o cadeado */
+
+        if (bytes_read != (int) entry->read_bytes) {
+            frame_free (kpage);
+            return false;
+        }
+    }
+
+    // Preenche o restante do frame com zeros
+    if (entry->zero_bytes > 0) {
+        memset (kpage + entry->read_bytes, 0, entry->zero_bytes);
+    }
+
+    // Conecta o endereço virtual ao físico
+    if (!pagedir_set_page (thread_current ()->pagedir, entry->upage, kpage, entry->writable)) {
+        frame_free (kpage);
+        return false; // Caso dê erro no processo
+    }
+
+    entry->is_loaded = true; // Marca como carregada
+    frame_unpin (kpage); // Solta o pin
+
+    return true;
 }

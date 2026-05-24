@@ -13,12 +13,13 @@
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
+#include "vm/page.h"
 
 #define FD_MIN 2
 #define FD_MAX 128
 
 // lock unico para serializar acesso ao filesys que nao e thread safe
-static struct lock filesys_lock;
+struct lock filesys_lock;
 
 static void syscall_handler (struct intr_frame *);
 static void syscall_exit (int status) NO_RETURN;
@@ -284,10 +285,31 @@ validate_user_address (const void *uaddr)
   struct thread *cur = thread_current ();
 
   // ponteiro valido precisa ser de user space e estar mapeado na pagedir atual
-  if (uaddr == NULL
-      || !is_user_vaddr (uaddr)
-      || pagedir_get_page (cur->pagedir, uaddr) == NULL)
+  if (uaddr == NULL || !is_user_vaddr (uaddr))
     syscall_exit (-1);
+
+  /* As páginas não são mais mapeadas todas, então pode apenas não ter sido
+     puxada e estar na tabela de paginas (spt) */
+
+  // Se ela já estiver mapeada é sucesso
+  if (pagedir_get_page (cur->pagedir, uaddr) != NULL)
+    return;  
+
+  // Se não, e preciso verificar se a página está na tabela
+  void *upage = pg_round_down (uaddr);
+  struct spt_entry *entry = spt_find (&cur->spt, upage);
+
+  // Se não tem ficha na spt, o usuário enviou um ponteiro inválido mesmo
+  if (entry == NULL)
+    syscall_exit (-1);
+
+  // Se tem ficha na SPT mas não está carregada, forçamos a puxar do disco AGORA
+  if (!entry->is_loaded)
+  {
+    if (!spt_load_page (entry))
+      syscall_exit (-1); // Falta de memória ou erro de disco
+  }
+  
 }
 
 static void

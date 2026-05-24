@@ -30,5 +30,6 @@ void spt_init (struct hash *spt);
 struct spt_entry *spt_find (struct hash *spt, void *upage);
 bool spt_insert (struct hash *spt, struct spt_entry *entry);
 void spt_destroy (struct hash *spt);
+bool spt_load_page (struct spt_entry *entry);
 
 #endif /* vm/page.h */

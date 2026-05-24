@@ -10,20 +10,13 @@ static struct list frame_table;
 
 struct list_elem *frame_find(void *kpage);
 
-struct frame_table_entry {
-    void *kpage;               // Endereço físico real (o frame na RAM, alocado com palloc)
-    struct thread *owner;      // Ponteiro para o processo dono deste frame
-    bool pinned;               // Flag crítica: se 'true', impede que o frame seja despejado durante I/O
-    struct list_elem elem;     // Para encadear na lista ou fila de controle
-};
-
 void frame_init (void)
 {
     lock_init (&frame_lock);
     list_init (&frame_table);
 }
 
-void *frame_allocate (enum palloc_flags flags)
+void *frame_allocate (enum palloc_flags flags, void *upage)
 {
     void* kpage =  palloc_get_page (flags); // Aloca o frame
 
@@ -48,6 +41,7 @@ void *frame_allocate (enum palloc_flags flags)
     }
 
     fte->kpage = kpage;
+    fte->upage = upage;
     fte->owner = thread_current (); // O processo atual é o dono
     fte->pinned = true;
     /*  Esse pinned serve para manter o frame livre de possíveis

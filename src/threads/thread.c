@@ -11,6 +11,7 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "vm/page.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -552,10 +553,6 @@ init_thread (struct thread *t, const char *name, int priority)
   t->next_fd = 2;
 #endif
   t->magic = THREAD_MAGIC;
-
-#ifdef VM
-    spt_init (&t->spt);
-#endif
 
   old_level = intr_disable ();
   list_push_back (&all_list, &t->allelem);
