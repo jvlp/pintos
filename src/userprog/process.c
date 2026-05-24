@@ -296,6 +296,10 @@ process_exit (void)
   struct list_elem *e;
   int fd;
 
+#ifdef VM
+  spt_destroy (&cur->spt);
+#endif
+
   // mensagem exigida pelos testes de userprog
   if (cur->pagedir != NULL)
     printf ("%s: exit(%d)\n", cur->name, cur->exit_status);

@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "lib/kernel/hash.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -96,6 +97,9 @@ struct thread
     struct list_elem elem;              /* List element. */
     
     unsigned long int wakeup_tick;
+
+    /* Virtual memory */
+    struct hash spt;
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
