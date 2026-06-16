@@ -22,6 +22,9 @@ typedef int tid_t;
 struct file;
 struct child_status;
 
+/* For memory map. */
+typedef int mapid_t;
+
 /* Thread priorities. */
 #define PRI_MIN 0                       /* Lowest priority. */
 #define PRI_DEFAULT 31                  /* Default priority. */
@@ -100,6 +103,10 @@ struct thread
 
     /* Virtual memory */
     struct hash spt;
+    struct list mmap_list;      // Lista de ficheiros mapeados 
+    mapid_t next_mapid;         // Próximo ID a ser atribuído
+
+    void *user_esp; /* Guarda o topo da pilha do utilizador nas syscalls */
 
 #ifdef USERPROG
     /* Owned by userprog/process.c. */

@@ -13,14 +13,6 @@
 
 #define UNAVAILABLE -100
 
-struct lock swap_lock;
-
-struct block * swap_block;
-
-struct list swap_list; // lista//
-
-static bool swap_initialization = false;
-
 struct swap_item {
 	struct list_elem elem;
 	bool available;

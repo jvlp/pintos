@@ -7,6 +7,7 @@
 #include <string.h>
 #include "userprog/syscall.h"
 #include "threads/synch.h"
+#include "vm/swap.h"
 
 // Função hash, chaveamento
 static unsigned int 
@@ -86,6 +87,10 @@ spt_destroy_func (struct hash_elem *e, void *aux UNUSED)
     if (entry->type == PAGE_FILE && entry->file != NULL) {
         file_close (entry->file);
     }
+    else if (entry->type == PAGE_SWAP) {
+        // Libera o espaço do disco quando o processo morre
+        swap_free(entry->swap_index);
+    }
 
     // Libera a memória alocada pro registro 
     free (entry);
@@ -101,28 +106,39 @@ spt_destroy (struct hash *spt)
 bool 
 spt_load_page (struct spt_entry *entry) 
 {
+
     //Pede um frame físico para a Frame Table.
     void *kpage = frame_allocate (PAL_USER, entry->upage);
     if (kpage == NULL) {
         return false;
     }
 
-    //Lê os dados do arquivo 
-    if (entry->read_bytes > 0) {
-        // Lê do disco no offset
-        lock_acquire (&filesys_lock); /* Pega o cadeado */
-        int bytes_read = file_read_at (entry->file, kpage, entry->read_bytes, entry->offset);
-        lock_release (&filesys_lock); /* Solta o cadeado */
+    // Verifica de onde a página deve vir
+    if (entry->type == PAGE_FILE) 
+    {
+        if (entry->read_bytes > 0) {
+            lock_acquire (&filesys_lock);
+            int bytes_read = file_read_at (entry->file, kpage, entry->read_bytes, entry->offset);
+            lock_release (&filesys_lock);
 
-        if (bytes_read != (int) entry->read_bytes) {
-            frame_free (kpage);
-            return false;
+            if (bytes_read != (int) entry->read_bytes) {
+                frame_free (kpage);
+                return false;
+            }
         }
-    }
-
-    // Preenche o restante do frame com zeros
-    if (entry->zero_bytes > 0) {
-        memset ((uint8_t *) kpage + entry->read_bytes, 0, entry->zero_bytes);
+        if (entry->zero_bytes > 0) {
+            memset ((uint8_t *) kpage + entry->read_bytes, 0, entry->zero_bytes);
+        }
+    } 
+    else if (entry->type == PAGE_SWAP) // Se estiver na swap, puxe
+    {
+        // Puxa os dados que estavam no disco de volta pra RAM recém alocada 
+        swap_in (entry->swap_index, kpage);
+    } 
+    else if (entry->type == PAGE_ZERO) 
+    {
+        // Zera a página
+        memset (kpage, 0, PGSIZE);
     }
 
     // Conecta o endereço virtual ao físico
@@ -135,4 +151,24 @@ spt_load_page (struct spt_entry *entry)
     frame_unpin (kpage); // Solta o pin
 
     return true;
+}
+
+bool 
+spt_grow_stack (void *upage) 
+{
+    struct spt_entry *entry = malloc (sizeof (struct spt_entry));
+    if (entry == NULL) return false;
+
+    entry->upage = pg_round_down(upage);
+    entry->type = PAGE_ZERO; // A pilha nova tem de nascer zerada
+    entry->is_loaded = false;
+    entry->writable = true;
+
+    // Se conseguir inserir na tabela, já aloca e liga a RAM imediatamente
+    if (spt_insert (&thread_current()->spt, entry)) {
+        return spt_load_page (entry);
+    }
+
+    free(entry);
+    return false;
 }

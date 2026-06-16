@@ -156,33 +156,34 @@ page_fault (struct intr_frame *f)
   struct spt_entry *entry = spt_find (&cur->spt, upage); //Acha a entrada
 
   if (entry != NULL) 
-  {
+  { 
     if (entry->is_loaded) {
       // Se já estava carregada, o usuário tentou escrever numa página read-only
       thread_current ()->exit_status = -1;
       thread_exit ();
     }
 
-    if (entry->type == PAGE_FILE) 
-    {
-       // Bota a página para carregar
-       if (!spt_load_page (entry)) {
-             PANIC ("Falha ao carregar do disco.");
-       }
-
-       return; // Volta e tentar carregar de novo
+    if (!spt_load_page (entry)) {
+            thread_current ()->exit_status = -1;
+            thread_exit ();
     }
-    else if (entry->type == PAGE_SWAP || entry->type == PAGE_ZERO) 
-    {
-      // Puxar do swap ou zera a página
-    }
+    return; // Volta a executar o programa
 
   } 
     else 
   {
-     // Pode ser um seg fault ou a pilha tentando crescer. 
-     thread_current ()->exit_status = -1;
-     thread_exit (); // Provisório, se não achou e não é pilha, morre.
+    void *stack_limit = ((uint8_t *) PHYS_BASE) - (8 * 1024 * 1024);  
+    void *esp = user ? f->esp : cur->user_esp;  // Descobre qual é o ESP verdadeiro
+    if (fault_addr != NULL && fault_addr >= stack_limit && fault_addr < PHYS_BASE && 
+        (uint8_t *) fault_addr >= (uint8_t *) esp - 32) 
+    {
+        if (spt_grow_stack(upage)) {
+            return; // Sucesso, a pilha expandiu-se e a thread volta a executar!
+        }
+    }
+    // Pode ser um seg fault diferente
+    thread_current ()->exit_status = -1;
+    thread_exit ();
   }  
 
   /* Código antigo 
