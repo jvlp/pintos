@@ -16,12 +16,15 @@ struct spt_entry {
     enum page_type type;     
     bool writable;             
     bool is_loaded;              // Se a página já estiver na ram
+    bool pinned; // impede que a página seja despejada para o swap //
 
     /* Dados para carregar do arquivo (PAGE_FILE) */
     struct file *file;
     off_t offset;
     uint32_t read_bytes;
     uint32_t zero_bytes;
+
+    size_t swap_index;// índice na swap//
 
     struct hash_elem elem;
 };
