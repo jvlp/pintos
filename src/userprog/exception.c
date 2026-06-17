@@ -4,7 +4,9 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#ifdef VM
 #include "vm/page.h"
+#endif
 #include "threads/vaddr.h"
 
 /* Number of page faults processed. */
@@ -149,6 +151,7 @@ page_fault (struct intr_frame *f)
     thread_exit ();
   }
   
+#ifdef VM
   // Arredonda o endereço para encontrar a chave tabela
   void *upage = pg_round_down (fault_addr);
   struct thread *cur = thread_current ();
@@ -183,6 +186,10 @@ page_fault (struct intr_frame *f)
      thread_current ()->exit_status = -1;
      thread_exit (); // Provisório, se não achou e não é pilha, morre.
   }  
+#else
+  thread_current ()->exit_status = -1;
+  thread_exit ();
+#endif
 
   /* Código antigo 
 
@@ -219,4 +226,3 @@ page_fault (struct intr_frame *f)
   */
 
 }
-

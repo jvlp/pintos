@@ -24,9 +24,22 @@ struct dir_entry
 /* Creates a directory with space for ENTRY_CNT entries in the
    given SECTOR.  Returns true if successful, false on failure. */
 bool
-dir_create (block_sector_t sector, size_t entry_cnt)
+dir_create (block_sector_t sector, size_t entry_cnt, block_sector_t parent_sector)
 {
-  return inode_create (sector, entry_cnt * sizeof (struct dir_entry));
+  struct dir *dir;
+  bool success;
+
+  success = inode_create (sector, entry_cnt * sizeof (struct dir_entry), true);
+  if (!success)
+    return false;
+
+  dir = dir_open (inode_open (sector));
+  if (dir == NULL)
+    return false;
+
+  success = dir_add (dir, ".", sector) && dir_add (dir, "..", parent_sector);
+  dir_close (dir);
+  return success;
 }
 
 /* Opens and returns the directory for the given INODE, of which
@@ -228,9 +241,26 @@ dir_readdir (struct dir *dir, char name[NAME_MAX + 1])
       dir->pos += sizeof e;
       if (e.in_use)
         {
+          if (!strcmp (e.name, ".") || !strcmp (e.name, ".."))
+            continue;
           strlcpy (name, e.name, NAME_MAX + 1);
           return true;
         } 
     }
   return false;
+}
+
+bool
+dir_is_empty (struct dir *dir)
+{
+  struct dir_entry e;
+  off_t ofs;
+
+  ASSERT (dir != NULL);
+
+  for (ofs = 0; inode_read_at (dir->inode, &e, sizeof e, ofs) == sizeof e;
+       ofs += sizeof e)
+    if (e.in_use && strcmp (e.name, ".") && strcmp (e.name, ".."))
+      return false;
+  return true;
 }

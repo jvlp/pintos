@@ -19,8 +19,10 @@
 #include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#ifdef VM
 #include "vm/frame.h"
 #include "vm/page.h"
+#endif
 #include "userprog/syscall.h"
 
 static thread_func start_process NO_RETURN;
@@ -58,6 +60,7 @@ struct start_process_args
     char *cmdline;
     // ponteiro para o registro compartilhado pai filho
     struct child_status *wait_status;
+    struct dir *cwd;
   };
 
 /* Starts a new thread running a user program loaded from
@@ -108,6 +111,9 @@ process_execute (const char *file_name)
     goto fail;
   args->cmdline = cmdline;
   args->wait_status = child;
+  args->cwd = thread_current ()->cwd != NULL
+              ? dir_reopen (thread_current ()->cwd)
+              : dir_open_root ();
 
   tid = thread_create (prog_name, PRI_DEFAULT, start_process, args);
   if (tid == TID_ERROR)
@@ -135,7 +141,10 @@ process_execute (const char *file_name)
   if (name_copy != NULL)
     palloc_free_page (name_copy);
   if (args != NULL)
-    free (args);
+    {
+      dir_close (args->cwd);
+      free (args);
+    }
   if (child != NULL)
     {
       child_status_release (child);
@@ -195,11 +204,13 @@ start_process (void *file_name_)
   struct start_process_args *args = file_name_;
   char *cmdline = args->cmdline;
   struct child_status *wait_status = args->wait_status;
+  struct dir *cwd = args->cwd;
   struct intr_frame if_;
   bool success;
 
   // liga a thread filha ao registro compartilhado criado pelo pai
   thread_current ()->wait_status = wait_status;
+  thread_current ()->cwd = cwd;
   // args so e usado no bootstrap e pode ser liberado cedo
   free (args);
 
@@ -211,7 +222,7 @@ start_process (void *file_name_)
   success = load (cmdline, &if_.eip, &if_.esp);
 
   // a copia da linha de comando pertence so ao filho
-  frame_free (cmdline);
+  palloc_free_page (cmdline);
 
   // publica resultado do load para process_execute
   lock_acquire (&wait_status->lock);
@@ -298,7 +309,9 @@ process_exit (void)
   struct list_elem *e;
   int fd;
 
+#ifdef VM
   spt_destroy (&cur->spt);
+#endif
 
   // mensagem exigida pelos testes de userprog
   if (cur->pagedir != NULL)
@@ -333,6 +346,18 @@ process_exit (void)
         file_close (cur->fd_table[fd]);
         cur->fd_table[fd] = NULL;
       }
+  for (fd = 2; fd < 128; fd++)
+    if (cur->dir_table[fd] != NULL)
+      {
+        dir_close (cur->dir_table[fd]);
+        cur->dir_table[fd] = NULL;
+      }
+
+  if (cur->cwd != NULL)
+    {
+      dir_close (cur->cwd);
+      cur->cwd = NULL;
+    }
 
   // libera lock de escrita do binario e fecha executavel
   if (cur->executable != NULL)
@@ -469,7 +494,9 @@ load (const char *cmdline, void (**eip) (void), void **esp)
     goto done;
   process_activate ();
 
+#ifdef VM
   spt_init (&t->spt);
+#endif
 
   cmdline_copy = palloc_get_page(0);
   stack_cmdline = palloc_get_page(0);
@@ -675,6 +702,7 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
         a tabela de página e se aloca de acordo com a necessidade. Para cada página que
         deveria ser alocada se vai criar um elemento na spt. */
 
+#ifdef VM
       struct spt_entry *entry = malloc (sizeof (struct spt_entry));
       if (entry == NULL) {
           return false; // Acabou a memória do Kernel 
@@ -694,6 +722,22 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
           free (entry);
           return false; // Falha ao inserir
       }
+#else
+      uint8_t *kpage = palloc_get_page (PAL_USER);
+      if (kpage == NULL)
+        return false;
+      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+        {
+          palloc_free_page (kpage);
+          return false;
+        }
+      memset (kpage + page_read_bytes, 0, page_zero_bytes);
+      if (!install_page (upage, kpage, writable))
+        {
+          palloc_free_page (kpage);
+          return false;
+        }
+#endif
 
       /* Código anterior...    
         // Get a page of memory.
@@ -744,7 +788,11 @@ setup_stack (void **esp, char *cmdline)
   // aloca pagina zerada da pilha de usuario e mapeia no topo
   // do espaco virtual de usuario (PHYS_BASE - PGSIZE ... PHYS_BASE).
   void *upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
+#ifdef VM
   kpage = frame_allocate (PAL_USER | PAL_ZERO, upage);
+#else
+  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+#endif
   if (kpage != NULL) 
     {
       // Essa memória deve ser alocada sem ser do lazy mode
@@ -755,6 +803,7 @@ setup_stack (void **esp, char *cmdline)
         *esp = PHYS_BASE;
         
         // Mapeando para a tabela de páginas
+#ifdef VM
         struct spt_entry *entry = malloc (sizeof (struct spt_entry));
         if (entry == NULL) 
         {
@@ -776,10 +825,15 @@ setup_stack (void **esp, char *cmdline)
         }
 
         frame_unpin (kpage);
+#endif
       }
       else
       {
+#ifdef VM
         frame_free (kpage);
+#else
+        palloc_free_page (kpage);
+#endif
       }
 
     }

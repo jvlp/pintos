@@ -20,6 +20,7 @@ enum thread_status
 typedef int tid_t;
 #define TID_ERROR ((tid_t) -1)          /* Error value for tid_t. */
 struct file;
+struct dir;
 struct child_status;
 
 /* Thread priorities. */
@@ -114,8 +115,10 @@ struct thread
     struct child_status *wait_status;   /* This thread's wait record in parent. */
     // tabela local de descritores 2..127
     struct file *fd_table[128];         /* Open file descriptors (2+). */
+    struct dir *dir_table[128];         /* Open directory descriptors. */
     // cursor de proxima tentativa de alocacao de fd
     int next_fd;                        /* Next fd candidate. */
+    struct dir *cwd;                    /* Current working directory. */
 #endif
 
     /* Owned by thread.c. */

@@ -2,6 +2,7 @@
 #include <bitmap.h>
 #include <debug.h>
 #include "filesys/file.h"
+#include "filesys/cache.h"
 #include "filesys/filesys.h"
 #include "filesys/inode.h"
 
@@ -44,7 +45,11 @@ free_map_allocate (size_t cnt, block_sector_t *sectorp)
 void
 free_map_release (block_sector_t sector, size_t cnt)
 {
+  size_t i;
+
   ASSERT (bitmap_all (free_map, sector, cnt));
+  for (i = 0; i < cnt; i++)
+    cache_invalidate (sector + i);
   bitmap_set_multiple (free_map, sector, cnt, false);
   bitmap_write (free_map, free_map_file);
 }
@@ -73,7 +78,7 @@ void
 free_map_create (void) 
 {
   /* Create inode. */
-  if (!inode_create (FREE_MAP_SECTOR, bitmap_file_size (free_map)))
+  if (!inode_create (FREE_MAP_SECTOR, bitmap_file_size (free_map), false))
     PANIC ("free map creation failed");
 
   /* Write bitmap to file. */

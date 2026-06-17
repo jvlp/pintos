@@ -14,6 +14,7 @@
 #include "vm/page.h"
 #ifdef USERPROG
 #include "userprog/process.h"
+#include "filesys/directory.h"
 #endif
 
 /* Random value for struct thread's `magic' member.
@@ -551,6 +552,7 @@ init_thread (struct thread *t, const char *name, int priority)
   t->wait_status = NULL;
   // 0 e 1 ficam reservados para stdin e stdout
   t->next_fd = 2;
+  t->cwd = NULL;
 #endif
   t->magic = THREAD_MAGIC;
 
