@@ -15,10 +15,12 @@
    Must be exactly BLOCK_SECTOR_SIZE bytes long. */
 struct inode_disk
   {
-    block_sector_t start;               /* First data sector. */
+    block_sector_t direct_blocks[123];  // 123 blocos diretos 
+    block_sector_t indirect_block;      // 1 bloco indireto 
+    block_sector_t doubly_indirect;
     off_t length;                       /* File size in bytes. */
     unsigned magic;                     /* Magic number. */
-    uint32_t unused[125];               /* Not used. */
+    uint32_t unused;               /* Not used. */
   };
 
 /* Returns the number of sectors to allocate for an inode SIZE
@@ -40,6 +42,9 @@ struct inode
     struct inode_disk data;             /* Inode content. */
   };
 
+// Um array de zeros para inicializar blocos no disco 
+static const char zeros[BLOCK_SECTOR_SIZE] = {0};
+
 /* Returns the block device sector that contains byte offset POS
    within INODE.
    Returns -1 if INODE does not contain data for a byte at offset
@@ -48,10 +53,48 @@ static block_sector_t
 byte_to_sector (const struct inode *inode, off_t pos) 
 {
   ASSERT (inode != NULL);
-  if (pos < inode->data.length)
-    return inode->data.start + pos / BLOCK_SECTOR_SIZE;
-  else
-    return -1;
+  if (pos >= inode->data.length) // Se tentar ler depois do fim
+    return 0;
+  
+  // Cada indice guarda 512 bytes
+  off_t index = pos / BLOCK_SECTOR_SIZE;
+
+  // Nível direto
+  if (index < 123) {
+      return inode->data.direct_blocks[index];
+  }
+  index -= 123;
+
+  // Nível indireto
+  if (index < 128) {
+      block_sector_t indirect_ptrs[128];
+      
+      // Lŵ a tabela de ponteiros usando a cache
+      cache_read (fs_device, inode->data.indirect_block, indirect_ptrs);
+      
+      return indirect_ptrs[index];
+  }
+  index -= 128;
+
+  // Duplamente direto
+  if (index < 128 * 128) {
+      block_sector_t doubly_ptrs[128];
+      block_sector_t indirect_ptrs[128];
+      
+      // Lê a primeira tabela
+      cache_read (fs_device, inode->data.doubly_indirect, doubly_ptrs);
+      
+      // Descobre em qual tabela secundária está e qual é a posição nela 
+      off_t indirect_index = index / 128;
+      off_t direct_index = index % 128;
+
+      cache_read (fs_device, doubly_ptrs[indirect_index], indirect_ptrs);
+      
+      return indirect_ptrs[direct_index];
+  }
+
+  return 0;
+    
 }
 
 /* List of open inodes, so that opening a single inode twice
@@ -63,6 +106,76 @@ void
 inode_init (void) 
 {
   list_init (&open_inodes);
+}
+
+// Estica o "arquivo"
+static bool
+inode_resize (struct inode_disk *id, off_t size) 
+{
+  if (size < 0) return false;
+
+  size_t num_sectors = bytes_to_sectors (size); // Numero de setores do inode
+ 
+  for (size_t i = 0; i < num_sectors; i++) 
+  {
+      if (i < 123) {
+          if (id->direct_blocks[i] == 0) { // Caso não esteja alocado
+              if (!free_map_allocate (1, &id->direct_blocks[i])) return false;
+              cache_write (fs_device, id->direct_blocks[i], zeros);
+          }
+      }
+      else if (i < 123 + 128) {
+          if (id->indirect_block == 0) {
+              if (!free_map_allocate (1, &id->indirect_block)) return false;
+              // Aloca o bloco indireto em si
+              cache_write (fs_device, id->indirect_block, zeros);
+          }
+          
+          block_sector_t indirect[128];
+          cache_read (fs_device, id->indirect_block, indirect);
+          
+          size_t offset = i - 123;
+          if (indirect[offset] == 0) { 
+              if (!free_map_allocate (1, &indirect[offset])) return false;
+              cache_write (fs_device, indirect[offset], zeros);
+              cache_write (fs_device, id->indirect_block, indirect); 
+          }
+      }
+      
+      else if (i < 123 + 128 + 128 * 128) {
+          if (id->doubly_indirect == 0) {
+              if (!free_map_allocate (1, &id->doubly_indirect)) return false;
+              cache_write (fs_device, id->doubly_indirect, zeros);
+          }
+          
+          block_sector_t doubly[128];
+          cache_read (fs_device, id->doubly_indirect, doubly);
+          
+          size_t index1 = (i - 123 - 128) / 128; // Qual é a tabela secundária? 
+          size_t index2 = (i - 123 - 128) % 128; // Em que posição dessa tabela?
+          
+          if (doubly[index1] == 0) {
+              if (!free_map_allocate (1, &doubly[index1])) return false;
+              cache_write (fs_device, doubly[index1], zeros);
+              cache_write (fs_device, id->doubly_indirect, doubly);
+          }
+          
+          block_sector_t indirect[128];
+          cache_read (fs_device, doubly[index1], indirect);
+          
+          if (indirect[index2] == 0) {
+              if (!free_map_allocate (1, &indirect[index2])) return false;
+              cache_write (fs_device, indirect[index2], zeros);
+              cache_write (fs_device, doubly[index1], indirect);
+          }
+      }
+      else {
+          return false;
+      }
+  }
+  
+  id->length = size; // Novo tamanho
+  return true;
 }
 
 /* Initializes an inode with LENGTH bytes of data and
@@ -85,24 +198,15 @@ inode_create (block_sector_t sector, off_t length)
   disk_inode = calloc (1, sizeof *disk_inode);
   if (disk_inode != NULL)
     {
-      size_t sectors = bytes_to_sectors (length);
-      disk_inode->length = length;
+      disk_inode->length = 0; // Começa com 0 
       disk_inode->magic = INODE_MAGIC;
-      if (free_map_allocate (sectors, &disk_inode->start)) 
+
+      if (inode_resize (disk_inode, length)) 
         {
-          //block_write (fs_device, sector, disk_inode);
+          // Guardamos a identidade no disco 
           cache_write (fs_device, sector, disk_inode);
-          if (sectors > 0) 
-            {
-              static char zeros[BLOCK_SECTOR_SIZE];
-              size_t i;
-              
-              for (i = 0; i < sectors; i++) 
-                //block_write (fs_device, disk_inode->start + i, zeros);
-                cache_write (fs_device, disk_inode->start + i, zeros);
-            }
-          success = true; 
-        } 
+          success = true;
+        }
       free (disk_inode);
     }
   return success;
@@ -161,6 +265,53 @@ inode_get_inumber (const struct inode *inode)
   return inode->sector;
 }
 
+// Percorre o Inode e liberta todos os blocos ocupados
+static void
+inode_deallocate (struct inode *inode)
+{
+  size_t data_sectors = bytes_to_sectors (inode->data.length);
+  size_t i;
+
+  for (i = 0; i < 123 && i < data_sectors; i++) {
+      if (inode->data.direct_blocks[i] != 0) {
+          free_map_release (inode->data.direct_blocks[i], 1);
+      }
+  }
+
+  if (inode->data.indirect_block != 0) {
+      block_sector_t indirect[128];
+      cache_read (fs_device, inode->data.indirect_block, indirect);
+      
+      for (i = 0; i < 128 && (i + 123) < data_sectors; i++) {
+          if (indirect[i] != 0) {
+              free_map_release (indirect[i], 1);
+          }
+      }
+      free_map_release (inode->data.indirect_block, 1); /* Liberta a própria tabela */
+  }
+
+  if (inode->data.doubly_indirect != 0) {
+      block_sector_t doubly[128];
+      cache_read (fs_device, inode->data.doubly_indirect, doubly);
+      
+      size_t j, k;
+      for (j = 0; j < 128 && (j * 128 + 123 + 128) < data_sectors; j++) {
+          if (doubly[j] != 0) {
+              block_sector_t indirect[128];
+              cache_read (fs_device, doubly[j], indirect);
+              
+              for (k = 0; k < 128 && (j * 128 + k + 123 + 128) < data_sectors; k++) {
+                  if (indirect[k] != 0) {
+                      free_map_release (indirect[k], 1);
+                  }
+              }
+              free_map_release (doubly[j], 1); /* Liberta a tabela secundária */
+          }
+      }
+      free_map_release (inode->data.doubly_indirect, 1); /* Liberta a tabela mestre */
+  }
+}
+
 /* Closes INODE and writes it to disk.
    If this was the last reference to INODE, frees its memory.
    If INODE was also a removed inode, frees its blocks. */
@@ -180,9 +331,10 @@ inode_close (struct inode *inode)
       /* Deallocate blocks if removed. */
       if (inode->removed) 
         {
+          // Limpa toda a hierarquia de dados do ficheiro 
+          inode_deallocate (inode);
+          // Liberta o próprio setor que continha o Inode
           free_map_release (inode->sector, 1);
-          free_map_release (inode->data.start,
-                            bytes_to_sectors (inode->data.length)); 
         }
 
       free (inode); 
@@ -270,6 +422,20 @@ inode_write_at (struct inode *inode, const void *buffer_, off_t size,
 
   if (inode->deny_write_cnt)
     return 0;
+
+   // Caso queira escrever para além do tamanho atual
+  if (offset + size > inode->data.length)
+  {
+    
+    if (!inode_resize (&inode->data, offset + size)) {
+        return 0; 
+    }
+    
+    inode->data.length = offset + size;
+    cache_write (fs_device, inode->sector, &inode->data);
+    
+    /* Solte aqui o lock do Inode se o tiver usado (lock_release(&inode->inode_lock);) */
+  }
 
   while (size > 0) 
     {
